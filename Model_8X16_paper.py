@@ -8,7 +8,7 @@ from sklearn.model_selection import train_test_split
 from pathlib import Path
 import os
 
-from metrics import make_metric_plots, make_histograms, make_images_for_model
+from metrics import make_images_for_model
 
 
 _THIS_PATH = Path(os.path.realpath(__file__)).parent
