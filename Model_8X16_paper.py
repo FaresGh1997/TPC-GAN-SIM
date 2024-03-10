@@ -1,31 +1,42 @@
+import tensorflow as tf 
 import numpy as np
 import pandas as pd
 import math
-import tensorflow as tf 
 import re
 from tqdm import trange
 from sklearn.model_selection import train_test_split
 from pathlib import Path
 import os
-
-from metrics import make_images_for_model
+from metrics import make_images_for_model,evaluate_model
+import h5py
+from tensorflow.python.keras.saving import hdf5_format
 
 
 _THIS_PATH = Path(os.path.realpath(__file__)).parent
 
-os.environ["XLA_FLAGS"]="--xla_gpu_cuda_data_dir=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.8"
 
+
+
+def setup_gpu():
+    os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+
+    logical_devices = tf.config.experimental.list_logical_devices('GPU')
+    assert len(logical_devices) > 0, "Not enough GPU hardware devices available"
 
 
 # function to convert raw csv data into data and corresponding features for the model
-def read_csv_2d(filename=None, pad_range=(40, 50), time_range=(265, 280), strict=True, misc_out=None):
+def read_csv_2d(filename=None, pad_range=(40, 50), time_range=(265, 280), strict=True):
     if filename is None:
         filename = str(_THIS_PATH.joinpath('Data', 'digits.csv'))
 
     df = pd.read_csv(filename)
 
-    def sel(df, col, limits):
-        return (df[col] >= limits[0]) & (df[col] < limits[1])
+    sel = lambda df, col, limits: (df[col] >= limits[0]) & (df[col] < limits[1])
+
 
     if 'drift_length' in df.columns:
         df['itime'] -= df['drift_length'].astype(int)
@@ -34,19 +45,14 @@ def read_csv_2d(filename=None, pad_range=(40, 50), time_range=(265, 280), strict
         df['ipad'] -= df['pad_coordinate'].astype(int)
 
     selection = sel(df, 'itime', time_range) & sel(df, 'ipad', pad_range)
-    g = df[selection].groupby('evtId')
-    bad_ids = df[~selection]['evtId'].unique()
-    anti_selection = df['evtId'].apply(lambda x: x in bad_ids)
-    anti_g = df[anti_selection].groupby('evtId')
-
+    
     if not selection.all():
-        msg = (
-            f"WARNING: current selection ignores {(~selection).sum() / len(selection) * 100}% of the data"
-            f" ({len(anti_g)} events)!"
-        )
+        msg = "WARNING: current selection ignores {value} of the data!".format(value = (~selection).sum() / len(selection) * 100)
         assert not strict, msg
         print(msg)
 
+    g = df[selection].groupby('evtId')
+    
     def convert_event(event):
         result = np.zeros(dtype=float, shape=(pad_range[1] - pad_range[0], time_range[1] - time_range[0]))
 
@@ -54,33 +60,21 @@ def read_csv_2d(filename=None, pad_range=(40, 50), time_range=(265, 280), strict
         result[indices] = event.amp.values
 
         return result
-
+    
     data = np.stack(g.apply(convert_event).values)
-    anti_data = None
-    if not selection.all() and misc_out is not None:
-        assert isinstance(misc_out, dict)
-        pad_range = [df[anti_selection]["ipad"].min(), df[anti_selection]["ipad"].max() + 1]
-        time_range = [df[anti_selection]["itime"].min(), df[anti_selection]["itime"].max() + 1]
-        anti_data = np.stack(anti_g.apply(convert_event).values)
-        misc_out["anti_data"] = anti_data
-        misc_out["bad_ids"] = bad_ids
-
+    
     if 'crossing_angle' in df.columns:
         features = ['crossing_angle', 'dip_angle']
         if 'drift_length' in df.columns:
             features += ['drift_length']
         if 'pad_coordinate' in df.columns:
             features += ['pad_coordinate']
-        if "row" in df.columns:
-            features += ["row"]
-        if "pT" in df.columns:
-            features += ["pT"]
-        assert (
-            (g[features].std() == 0).all(axis=1) | (g[features].size() == 1)
-        ).all(), 'Varying features within same events...'
+        assert (g[features].std() == 0).all().all(), 'Varying features within same events...'
         return data, g[features].mean().values
-
+    
     return data
+
+    
 
 #
 @tf.function
@@ -159,7 +153,7 @@ def create_discriminator_structure():
        
     reshaped_vec = tf.tile(
     tf.keras.layers.Reshape((1, 1) + vector_shape)(input_vec),
-        (1, *img_shape[:2], 1)
+        (1, img_shape[0],img_shape[1], 1)
     )
     block_input = tf.keras.layers.Concatenate(axis=-1)([block_input, reshaped_vec])
 
@@ -241,7 +235,39 @@ class GAN_Model:
         
         self.generator.compile(optimizer=self.gen_opt, loss='mean_squared_error')
         self.discriminator.compile(optimizer=self.disc_opt, loss='mean_squared_error')
-            
+    
+    def load_generator(self, checkpoint):
+        self._load_weights(checkpoint, 'gen')
+
+    def load_discriminator(self, checkpoint):
+        self._load_weights(checkpoint, 'disc')
+
+    def _load_weights(self, checkpoint, gen_or_disc):
+        if gen_or_disc == 'gen':
+            network = self.generator
+            step_fn = self.gen_step
+        elif gen_or_disc == 'disc':
+            network = self.discriminator
+            step_fn = self.disc_step
+        else:
+            raise ValueError(gen_or_disc)
+
+        model_file = h5py.File(checkpoint, 'r')
+        if len(network.optimizer.weights) == 0 and 'optimizer_weights' in model_file:
+            # perform single optimization step to init optimizer weights
+            features_shape = self.discriminator.inputs[0].shape.as_list()
+            targets_shape = self.discriminator.inputs[1].shape.as_list()
+            features_shape[0], targets_shape[0] = 1, 1
+            step_fn(tf.zeros(features_shape), tf.zeros(targets_shape))
+
+        print(f'Loading {gen_or_disc} weights from {str(checkpoint)}')
+        network.load_weights(str(checkpoint))
+        
+        if 'optimizer_weights' in model_file:
+            print('Also recovering the optimizer state')
+            opt_weight_values = hdf5_format.load_optimizer_weights_from_hdf5_group(model_file)
+            network.optimizer.set_weights(opt_weight_values)    
+        
     @tf.function
     def make_fake (self,features):
         size = tf.shape(features)[0]
@@ -320,28 +346,31 @@ def epoch_from_name(name):
     return int(epoch)
 
 
-def load_weights(model, model_path):
+def latest_epoch(model_path):
     gen_checkpoints = model_path.glob("generator_*.h5")
     disc_checkpoints = model_path.glob("discriminator_*.h5")
-    latest_gen_checkpoint = max(
-        gen_checkpoints,
-        key=lambda path: epoch_from_name(path.stem)
-    )
-    latest_disc_checkpoint = max(
-        disc_checkpoints,
-        key=lambda path: epoch_from_name(path.stem)
-    )
-    
-    assert (
-        epoch_from_name(latest_gen_checkpoint.stem) == epoch_from_name(latest_disc_checkpoint.stem)
-    ), "Latest disc and gen epochs differ"
 
-    print(f'Loading generator weights from {str(latest_gen_checkpoint)}')
-    model.generator.load_weights(str(latest_gen_checkpoint))
-    print(f'Loading discriminator weights from {str(latest_disc_checkpoint)}')
-    model.discriminator.load_weights(str(latest_disc_checkpoint))
-    
-    return latest_gen_checkpoint, latest_disc_checkpoint
+    gen_epochs = [epoch_from_name(path.stem) for path in gen_checkpoints]
+    disc_epochs = [epoch_from_name(path.stem) for path in disc_checkpoints]
+
+    latest_gen_epoch = max(gen_epochs)
+    latest_disc_epoch = max(disc_epochs)
+
+    assert latest_gen_epoch == latest_disc_epoch, "Latest disc and gen epochs differ"
+
+    return latest_gen_epoch
+
+def load_weights(model, model_path, epoch=None):
+    if epoch is None:
+        epoch = latest_epoch(model_path)
+
+    gen_checkpoint = model_path / f"generator_{epoch:05d}.h5"
+    disc_checkpoint = model_path / f"discriminator_{epoch:05d}.h5"
+
+    model.load_generator(gen_checkpoint)
+    model.load_discriminator(disc_checkpoint)
+
+    return epoch
 
 class SaveModelCallback:
     def __init__(self, model, path, save_period):
@@ -351,7 +380,7 @@ class SaveModelCallback:
 
     def __call__(self, step):
         if step % self.save_period == 0:
-            print(f'Saving model on step {step} to {self.path}')
+            print('Saving model on step {s} to {p}'.format(s = step, p = self.path))
             self.model.generator.save(str(self.path.joinpath("generator_{:05d}.h5".format(step))))
             self.model.discriminator.save(str(self.path.joinpath("discriminator_{:05d}.h5".format(step))))
 
@@ -412,12 +441,13 @@ class Logarithmic:
 
 def train(data_train, data_val, train_step_fn, loss_eval_fn, num_epochs, batch_size,
           train_writer=None, val_writer=None, callbacks=[], features_train=None, features_val=None, first_epoch=0):
+    
     if not ((features_train is None) or (features_val is None)):
         assert features_train is not None, 'train: features should be provided for both train and val'
         assert features_val is not None, 'train: features should be provided for both train and val'
 
     for i_epoch in range(first_epoch, num_epochs):
-        print("Working on epoch #{}".format(i_epoch), flush=True)
+        print("Working on epoch #{}".format(i_epoch))
 
         tf.keras.backend.set_learning_phase(1)  # training
         
@@ -465,16 +495,20 @@ def train(data_train, data_val, train_step_fn, loss_eval_fn, num_epochs, batch_s
                 for k, l in losses_val.items():
                     tf.summary.scalar(k, l, i_epoch)
 
-        print("", flush=True)
+        print("")
         print("Train losses:", losses_train)
         print("Val losses:", losses_val)
         
 def main():
-    num_epochs = 8
-    checkpoint_name = "First_Try"
+    checkpoint_name = "First_Try_GPU"
     save_every = 50
     
+    continue_training = True
     
+    prediction_process = True
+
+    print("Num GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
+    setup_gpu()
     model_path = Path('saved_models') / checkpoint_name
     
     if model_path.exists():
@@ -487,7 +521,12 @@ def main():
     time_range=(-7, 9)
     
     # initializing the model itself
-    model = GAN_Model(num_epochs= num_epochs)
+    model = GAN_Model()
+    
+    
+    next_epoch = 0
+    if  continue_training or prediction_process:
+        next_epoch = load_weights(model, model_path) + 1
     
     #print ("********Generator*******")
     #print (model.generator.summary())
@@ -519,36 +558,55 @@ def main():
     
     print ("********Data splitted*******")
     
-    writer_train = tf.summary.create_file_writer(f'logs/{checkpoint_name}/train')
-    writer_val = tf.summary.create_file_writer(f'logs/{checkpoint_name}/validation')
+    
+    if not prediction_process:        
+        writer_train = tf.summary.create_file_writer(str(_THIS_PATH.joinpath('logs',checkpoint_name, 'train')))
+        writer_val = tf.summary.create_file_writer(str(_THIS_PATH.joinpath('logs',checkpoint_name, 'validation')))
     
     
-    print ("********Initializing CallBacks*******")
-    save_model = SaveModelCallback(
-            model=model, path=model_path, save_period=save_every
-        )
-    
-    write_hist_summary = WriteHistSummaryCallback(
-            model, sample=(X_test, Y_test),
-            save_period=save_every, writer=writer_val
-        )
-    
-    schedule_lr = ScheduleLRCallback(
-            model, writer=writer_val,
-            func_gen=get_scheduler(model.lr, model.lr_schedule),
-            func_disc=get_scheduler(model.lr, model.lr_schedule)
-        )
-    #print ("Y_train shape = ", Y_train.shape)
-    print ("********Data training initialized*******")
-    
-    with tf.device('/CPU:0'):
+        print ("********Initializing CallBacks*******")
+        save_model = SaveModelCallback(
+                model=model, path=model_path, save_period=save_every
+            )
+        
+        write_hist_summary = WriteHistSummaryCallback(
+                model, sample=(X_test, Y_test),
+                save_period=save_every, writer=writer_val
+            )
+        
+        schedule_lr = ScheduleLRCallback(
+                model, writer=writer_val,
+                func_gen=get_scheduler(model.lr, model.lr_schedule),
+                func_disc=get_scheduler(model.lr, model.lr_schedule)
+            )
+        
+        if continue_training:
+            schedule_lr(next_epoch -1)
+        #print ("Y_train shape = ", Y_train.shape)
+        print ("********Data training initialized*******")
+        
         
         train(Y_train, Y_test, model.training_step, model.calculate_losses, model.num_epochs, model.batch_size,
-              train_writer=writer_train, val_writer=writer_val,
-              callbacks=[write_hist_summary, save_model, schedule_lr],
-              features_train=X_train, features_val=X_test)
-    
-    print ("********Data training initialized********")
+                train_writer=writer_train, val_writer=writer_val,
+                callbacks=[write_hist_summary, save_model, schedule_lr],
+                features_train=X_train, features_val=X_test,first_epoch=next_epoch)
+        
+        print ("********Data training initialized********")
+        
+    else:
+        epoch = latest_epoch(model_path=model_path)
+        pridiction_path = model_path/f"prediction_{epoch:05d}"
+        pridiction_path.mkdir()
+        
+        for part in ['train', 'test']:
+            evaluate_model(
+                model, path=pridiction_path / part,
+                sample=(
+                    (X_train, Y_train) if part == 'train'
+                    else (X_test, Y_test)
+                ),pad_range = pad_range, time_range = time_range,
+                gen_sample_name=(None if part == 'train' else 'generated.dat')
+            )
 
     
 if __name__ == "__main__" :

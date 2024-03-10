@@ -164,7 +164,7 @@ def make_images_for_model(model,
     return result
 
 
-def evaluate_model(model, path, sample, gen_sample_name=None):
+def evaluate_model(model, path, sample, pad_range,time_range, gen_sample_name=None):
     path.mkdir()
     pdf_outputs = []
     (
@@ -196,8 +196,8 @@ def evaluate_model(model, path, sample, gen_sample_name=None):
         with open(str(path / gen_sample_name), 'w') as f:
             for event_X, event_Y in zip(*gen_dataset):
                 f.write('params: {:.3f} {:.3f} {:.3f} {:.3f}\n'.format(*event_X))
-                for ipad, time_distr in enumerate(event_Y, model.pad_range[0] + event_X[3].astype(int)):
-                    for itime, amp in enumerate(time_distr, model.time_range[0] + event_X[2].astype(int)):
+                for ipad, time_distr in enumerate(event_Y, pad_range[0] + event_X[3].astype(int)):
+                    for itime, amp in enumerate(time_distr, time_range[0] + event_X[2].astype(int)):
                         if amp < 1:
                             continue
                         f.write(" {:2d} {:3d} {:8.3e} ".format(ipad, itime, amp))
