@@ -500,16 +500,17 @@ def train(data_train, data_val, train_step_fn, loss_eval_fn, num_epochs, batch_s
         print("Val losses:", losses_val)
         
 def main():
-    checkpoint_name = "First_Try_GPU"
+    checkpoint_name = "Second_Try_GPU"
     save_every = 50
     
-    continue_training = True
+    continue_training = False
     
-    prediction_process = True
+    prediction_process = False
 
     print("Num GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
     setup_gpu()
-    model_path = Path('saved_models') / checkpoint_name
+    model_path = _THIS_PATH.joinpath('saved_models',checkpoint_name)
+    #model_path = Path('saved_models') / checkpoint_name
     
     if model_path.exists():
         print ("Model directory already exists")
